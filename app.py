@@ -262,14 +262,13 @@ def process():
             
             # Build SVG
             dwg = svgwrite.Drawing(size=(w, h))
-            dwg.add(dwg.rect(insert=(0,0), size=(w,h), fill='none'))
+            
             color_rgb = svgwrite.rgb(*color)
             
             for contour in contours:
                 if len(contour) >= 3:
                     path_data = "M " + " L ".join(f"{x},{y}" for x, y in contour) + " Z"
-                    dwg.add(dwg.path(d=path_data, fill=color_rgb, stroke='none'))
-            
+                    
             svg_str = dwg.tostring()
             layers.append({
                 'name': f'layer_{i+1}.svg',
