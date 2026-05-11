@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 from PIL import Image
 import numpy as np
-from sklearn.cluster import KMeans
+from sklearn.cluster import MiniBatchKMeans
 import cv2
 import io
 import zipfile
@@ -17,8 +17,6 @@ HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#4CAF50">
 <title>3D Layers</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -39,7 +37,7 @@ input[type=range]{width:100%;margin:10px 0}
 .downloads a.inst{background:#e3f2fd;color:#1565c0}
 .downloads a.zip{background:#fff3e0;color:#e65100}
 .spinner-wrap{text-align:center;padding:20px;display:none}
-.spinner{display:inline-block;width:40px;height:40px;border:4px solid #ccc;border-top-color:#4CAF50;border-radius:50%;animation:s .8s linear infinite}
+.spinner{display:inline-block;width:40px;height:40px;border:4px solid #ccc;border-top-color:#4CAF50;border-radius:50%;animation:s.8s linear infinite}
 @keyframes s{to{transform:rotate(360deg)}}
 #status{text-align:center;margin:10px 0;font-weight:600;color:#555}
 </style>
@@ -92,6 +90,31 @@ finally{b.disabled=false;document.getElementById('spinner').style.display='none'
 </body>
 </html>'''
 
+def preprocess_image(img, max_dim=1200):
+    """Resize + denoise so contours are clean"""
+    w, h = img.size
+    if max(w, h) > max_dim:
+        scale = max_dim / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    # Bilateral filter keeps edges sharp but removes noise
+    np_img = np.array(img)
+    denoised = cv2.bilateralFilter(np_img, 9, 75, 75)
+    return Image.fromarray(denoised), img.size
+
+def color_quantize(img, k):
+    """Reduce colors first, then cluster. This fixes speckles."""
+    np_img = np.array(img)
+    pixels = np_img.reshape(-1, 3).astype(np.float32)
+
+    # MiniBatchKMeans is faster and more stable on Render
+    kmeans = MiniBatchKMeans(n_clusters=k, random_state=0, batch_size=1000, n_init=3)
+    labels = kmeans.fit_predict(pixels)
+    centers = kmeans.cluster_centers_.astype(np.uint8)
+
+    quantized = centers[labels].reshape(np_img.shape)
+    return quantized, centers, labels.reshape(img.size[1], img.size[0])
+
 @app.route('/')
 def home():
     return render_template_string(HTML)
@@ -101,102 +124,103 @@ def process():
     try:
         f = request.files['image']
         n = int(request.form.get('layers', 5))
-        
+
         img = Image.open(f.stream).convert('RGB')
-        w, h = img.size
-        if max(w,h) > 600:
-            s = 600 / max(w,h)
-            img = img.resize((int(w*s), int(h*s)))
-            w, h = img.size
-        
-        arr = np.array(img).reshape(-1, 3).astype(float)
-        km = KMeans(n_clusters=n, random_state=0, n_init=10)
-        lbs = km.fit_predict(arr)
-        ctrs = km.cluster_centers_.astype(int)
-        lbl_img = lbs.reshape(h, w)
-        
+
+        # 1. Preprocess
+        img, (w, h) = preprocess_image(img, 1200)
+
+        # 2. Quantize colors FIRST - this is the main fix
+        quantized_img, centers, lbl_img = color_quantize(img, n)
+
         layers = []
-        paths = []
-        
+        layer_data = []
+
         for i in range(n):
-            # Create binary mask for the specific layer
             mask = (lbl_img == i).astype(np.uint8) * 255
-            color = tuple(ctrs[i])
-            hex_c = '#{:02x}{:02x}{:02x}'.format(*color)
-            
-            # Smooth edges slightly to prevent staircase pixels in final cut
-            kernel = np.ones((3, 3), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            
-            # Trace vector contours (RETR_TREE ensures holes are traced)
-            contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            
+
+            # Clean mask
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
+
+            # Find external contours only - no holes in holes
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            # Filter tiny noise
+            contours = [c for c in contours if cv2.contourArea(c) > 100]
+
+            if not contours:
+                continue
+
             path_d = ""
             for cnt in contours:
-                # Simplify points to prevent machine crashing
-                approx = cv2.approxPolyDP(cnt, 1.0, True)
-                
+                epsilon = 0.002 * cv2.arcLength(cnt, True)
+                approx = cv2.approxPolyDP(cnt, epsilon, True)
+
                 if len(approx) >= 3:
-                    # Construct SVG continuous path commands
                     path_d += f"M {approx[0][0][0]} {approx[0][0][1]} "
                     for pt in approx[1:]:
                         path_d += f"L {pt[0][0]} {pt[0][1]} "
                     path_d += "Z "
-            
-            paths.append((hex_c, path_d))
-            
-            # fill-rule="evenodd" ensures holes are punched out cleanly
+
+            if not path_d:
+                continue
+
+            color = tuple(centers[i])
+            hex_c = '#{:02x}{:02x}{:02x}'.format(*color)
+            brightness = 0.299*color[0] + 0.587*color[1] + 0.114*color[2]
+
+            layer_data.append({'color': hex_c, 'path': path_d, 'brightness': brightness, 'idx': i})
+
             svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
-            if path_d:
-                svg += f'<path d="{path_d}" fill="{hex_c}" stroke="none" fill-rule="evenodd"/>'
+            svg += f'<path d="{path_d}" fill="{hex_c}" stroke="none" fill-rule="evenodd"/>'
             svg += '</svg>'
-            
+
             layers.append({
                 'name': f'layer_{i+1}.svg',
                 'data': base64.b64encode(svg.encode()).decode()
             })
-        
-        # Build optimized instructions map using the vector paths instead of math arrays
-        areas = [np.sum(lbl_img == i) for i in range(n)]
-        order = sorted(range(n), key=lambda i: areas[i], reverse=True)
-        
-        ox, oy = 20, -20
-        iw = w + abs(ox)*(n-1) + 40
-        ih = h + abs(oy)*(n-1) + 40
-        
+
+        # 3. Sort by brightness for correct 3D stack
+        # Dark = bottom, Light = top
+        layer_data.sort(key=lambda x: x['brightness'])
+
+        # 4. Build instruction SVG
+        ox, oy = 15, -15
+        iw = w + abs(ox)*(len(layer_data)-1) + 40
+        ih = h + abs(oy)*(len(layer_data)-1) + 40
+
         inst = f'<svg xmlns="http://www.w3.org/2000/svg" width="{iw}" height="{ih}" viewBox="0 0 {iw} {ih}">'
         inst += f'<rect width="100%" height="100%" fill="white"/>'
-        
-        for idx, i in enumerate(order):
-            hex_c, path_d = paths[i]
-            dx, dy = ox*idx+20, oy*idx + abs(oy)*(n-1)+20
-            
-            if path_d:
-                inst += f'<g transform="translate({dx}, {dy})">'
-                inst += f'<path d="{path_d}" fill="{hex_c}" stroke="#333" stroke-width="0.5" fill-rule="evenodd" opacity="0.9"/>'
-                inst += '</g>'
-            
-            inst += f'<text x="{10+dx}" y="{h+25+dy}" fill="black" font-size="16" font-family="Arial" font-weight="bold">Layer {idx+1}</text>'
-        
+
+        for idx, layer in enumerate(layer_data):
+            dx, dy = ox*idx+20, oy*idx+20
+            inst += f'<g transform="translate({dx}, {dy})">'
+            inst += f'<path d="{layer["path"]}" fill="{layer["color"]}" stroke="#333" stroke-width="0.5" fill-rule="evenodd"/>'
+            inst += f'</g>'
+            inst += f'<text x="{10+dx}" y="{h+25+dy}" fill="black" font-size="14" font-family="Arial" font-weight="bold">Layer {idx+1}</text>'
+
         inst += '</svg>'
         inst_b64 = base64.b64encode(inst.encode()).decode()
-        
-        # Bundle everything into the ZIP
+
+        # Zip
         zb = io.BytesIO()
         with zipfile.ZipFile(zb, 'w', zipfile.ZIP_DEFLATED) as zf:
             for l in layers:
                 zf.writestr(l['name'], base64.b64decode(l['data']).decode())
             zf.writestr('instructions.svg', inst)
         zip_b64 = base64.b64encode(zb.getvalue()).decode()
-        
+
+        # Sort download layers to match instruction order
+        layers_sorted = [layers[d['idx']] for d in layer_data]
+
         return jsonify({
-            'layers': layers,
+            'layers': layers_sorted,
             'inst': inst_b64,
             'preview': inst_b64,
             'zip': zip_b64
         })
-        
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
