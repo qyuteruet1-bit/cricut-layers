@@ -262,7 +262,7 @@ def process():
             
             # Build SVG
             dwg = svgwrite.Drawing(size=(w, h))
-            dwg.add(dwg.rect(insert=(0,0), size=(w,h), fill='white'))
+            dwg.add(dwg.rect(insert=(0,0), size=(w,h), fill='none'))
             color_rgb = svgwrite.rgb(*color)
             
             for contour in contours:
@@ -293,7 +293,7 @@ def process():
         inst_h = h + abs(oy) * (n_layers - 1)
         
         inst_svg = svgwrite.Drawing(size=(inst_w, inst_h))
-        inst_svg.add(inst_svg.rect(insert=(0,0), size=('100%','100%'), fill='white'))
+        inst_svg.add(inst_svg.rect(insert=(0,0), size=('100%','100%'), fill='none'))
         
         for idx, i in enumerate(order):
             mask_img = masks_list[i]
