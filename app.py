@@ -3,6 +3,7 @@ from flask_cors import CORS
 from PIL import Image
 import numpy as np
 from sklearn.cluster import KMeans
+import cv2
 import io
 import zipfile
 import base64
@@ -115,42 +116,48 @@ def process():
         lbl_img = lbs.reshape(h, w)
         
         layers = []
-        colors = []
+        paths = []
         
         for i in range(n):
-            mask = (lbl_img == i)
+            # Create binary mask for the specific layer
+            mask = (lbl_img == i).astype(np.uint8) * 255
             color = tuple(ctrs[i])
-            colors.append(color)
             hex_c = '#{:02x}{:02x}{:02x}'.format(*color)
             
-            # Find all pixels of this color and create rectangles for contiguous regions
-            # Simple approach: scan rows and create horizontal strips
-            svg_parts = []
-            for y in range(h):
-                x_start = None
-                for x in range(w):
-                    if mask[y, x]:
-                        if x_start is None:
-                            x_start = x
-                    else:
-                        if x_start is not None:
-                            if x - x_start > 2:  # ignore tiny strips
-                                svg_parts.append(f'<rect x="{x_start}" y="{y}" width="{x-x_start}" height="1" fill="{hex_c}" stroke="none"/>')
-                            x_start = None
-                if x_start is not None and w - x_start > 2:
-                    svg_parts.append(f'<rect x="{x_start}" y="{y}" width="{w-x_start}" height="1" fill="{hex_c}" stroke="none"/>')
+            # Smooth edges slightly to prevent staircase pixels in final cut
+            kernel = np.ones((3, 3), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
             
+            # Trace vector contours (RETR_TREE ensures holes are traced)
+            contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            
+            path_d = ""
+            for cnt in contours:
+                # Simplify points to prevent machine crashing
+                approx = cv2.approxPolyDP(cnt, 1.0, True)
+                
+                if len(approx) >= 3:
+                    # Construct SVG continuous path commands
+                    path_d += f"M {approx[0][0][0]} {approx[0][0][1]} "
+                    for pt in approx[1:]:
+                        path_d += f"L {pt[0][0]} {pt[0][1]} "
+                    path_d += "Z "
+            
+            paths.append((hex_c, path_d))
+            
+            # fill-rule="evenodd" ensures holes are punched out cleanly
             svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
-            svg += ''.join(svg_parts)
+            if path_d:
+                svg += f'<path d="{path_d}" fill="{hex_c}" stroke="none" fill-rule="evenodd"/>'
             svg += '</svg>'
             
             layers.append({
                 'name': f'layer_{i+1}.svg',
-                'data': base64.b64encode(svg.encode()).decode(),
-                'count': len(svg_parts)
+                'data': base64.b64encode(svg.encode()).decode()
             })
         
-        # Instructions
+        # Build optimized instructions map using the vector paths instead of math arrays
         areas = [np.sum(lbl_img == i) for i in range(n)]
         order = sorted(range(n), key=lambda i: areas[i], reverse=True)
         
@@ -162,29 +169,20 @@ def process():
         inst += f'<rect width="100%" height="100%" fill="white"/>'
         
         for idx, i in enumerate(order):
-            mask = (lbl_img == i)
-            color = colors[i]
-            hex_c = '#{:02x}{:02x}{:02x}'.format(*color)
+            hex_c, path_d = paths[i]
             dx, dy = ox*idx+20, oy*idx + abs(oy)*(n-1)+20
             
-            for y in range(h):
-                xs = None
-                for x in range(w):
-                    if mask[y,x]:
-                        if xs is None: xs = x
-                    else:
-                        if xs is not None and x-xs > 2:
-                            inst += f'<rect x="{xs+dx}" y="{y+dy}" width="{x-xs}" height="1" fill="{hex_c}" stroke="none" opacity="0.9"/>'
-                        xs = None
-                if xs is not None and w-xs > 2:
-                    inst += f'<rect x="{xs+dx}" y="{y+dy}" width="{w-xs}" height="1" fill="{hex_c}" stroke="none" opacity="0.9"/>'
+            if path_d:
+                inst += f'<g transform="translate({dx}, {dy})">'
+                inst += f'<path d="{path_d}" fill="{hex_c}" stroke="#333" stroke-width="0.5" fill-rule="evenodd" opacity="0.9"/>'
+                inst += '</g>'
             
             inst += f'<text x="{10+dx}" y="{h+25+dy}" fill="black" font-size="16" font-family="Arial" font-weight="bold">Layer {idx+1}</text>'
         
         inst += '</svg>'
         inst_b64 = base64.b64encode(inst.encode()).decode()
         
-        # ZIP
+        # Bundle everything into the ZIP
         zb = io.BytesIO()
         with zipfile.ZipFile(zb, 'w', zipfile.ZIP_DEFLATED) as zf:
             for l in layers:
