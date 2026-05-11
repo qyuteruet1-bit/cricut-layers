@@ -8,6 +8,7 @@ import io
 import zipfile
 import base64
 import os
+from rembg import remove
 
 app = Flask(__name__)
 CORS(app)
@@ -17,6 +18,7 @@ HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#4CAF50">
 <title>3D Layers</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -30,6 +32,7 @@ h1{font-size:1.6rem;text-align:center;margin-bottom:5px}
 .btn-outline{padding:14px;background:#fff;color:#4CAF50;border:2px solid #4CAF50;border-radius:12px;font-size:1rem;font-weight:700;cursor:pointer;text-align:center}
 .btn:disabled{opacity:.5}
 input[type=range]{width:100%;margin:10px 0}
+.check-row{display:flex;align-items:center;gap:8px;margin:10px 0;font-size:.95rem}
 .preview-img{max-width:100%;border-radius:12px;display:none}
 .downloads{margin-top:15px}
 .downloads a{display:block;padding:12px 15px;margin:5px 0;border-radius:10px;text-decoration:none;font-weight:600;font-size:.95rem}
@@ -52,19 +55,34 @@ input[type=range]{width:100%;margin:10px 0}
 </div>
 <input type="file" id="fileInput" accept="image/*" style="display:none">
 <input type="file" id="cameraInput" accept="image/*" capture="environment" style="display:none">
-<label>Layers: <span id="layerNum">5</span></label>
-<input type="range" id="layers" min="3" max="8" value="5" step="1">
+
+<label>Layers: <span id="layerNum">4</span></label>
+<input type="range" id="layers" min="3" max="6" value="4" step="1">
+
+<div class="check-row">
+<input type="checkbox" id="removeBg" checked>
+<label for="removeBg">Remove Background</label>
+</div>
+
+<div class="check-row">
+<input type="checkbox" id="keepBg">
+<label for="keepBg">Keep Background as Base Layer</label>
+</div>
+
 <button class="btn" onclick="process()">🎨 Generate</button>
 </div>
+
 <div class="spinner-wrap" id="spinner"><div class="spinner"></div></div>
 <div id="status"></div>
 <img class="preview-img" id="preview">
 <div class="downloads" id="downloads"></div>
+
 <script>
 var sf=null
 document.getElementById('fileInput').onchange=function(e){if(e.target.files[0])sf=e.target.files[0]}
 document.getElementById('cameraInput').onchange=function(e){if(e.target.files[0])sf=e.target.files[0]}
 document.getElementById('layers').oninput=function(){document.getElementById('layerNum').textContent=this.value}
+
 async function process(){
 if(!sf){alert('Choose an image first');return}
 const b=document.querySelector('.btn');b.disabled=true
@@ -72,7 +90,13 @@ document.getElementById('spinner').style.display='block'
 document.getElementById('status').textContent='Processing...'
 document.getElementById('downloads').innerHTML=''
 document.getElementById('preview').style.display='none'
-const fd=new FormData();fd.append('image',sf);fd.append('layers',document.getElementById('layers').value)
+
+const fd=new FormData();
+fd.append('image',sf);
+fd.append('layers',document.getElementById('layers').value);
+fd.append('removebg',document.getElementById('removeBg').checked);
+fd.append('keepbg',document.getElementById('keepBg').checked);
+
 try{
 const r=await fetch('/process',{method:'POST',body:fd})
 if(!r.ok)throw new Error(await r.text())
@@ -90,30 +114,30 @@ finally{b.disabled=false;document.getElementById('spinner').style.display='none'
 </body>
 </html>'''
 
-def preprocess_image(img, max_dim=1200):
-    """Resize + denoise so contours are clean"""
+def preprocess_image(img, max_dim=1200, remove_bg=True):
+    """Resize, remove background, denoise"""
     w, h = img.size
     if max(w, h) > max_dim:
         scale = max_dim / max(w, h)
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-    # Bilateral filter keeps edges sharp but removes noise
+    if remove_bg:
+        img = remove(img) # returns RGBA
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split(3))
+        img = bg
+
     np_img = np.array(img)
     denoised = cv2.bilateralFilter(np_img, 9, 75, 75)
     return Image.fromarray(denoised), img.size
 
 def color_quantize(img, k):
-    """Reduce colors first, then cluster. This fixes speckles."""
     np_img = np.array(img)
     pixels = np_img.reshape(-1, 3).astype(np.float32)
-
-    # MiniBatchKMeans is faster and more stable on Render
     kmeans = MiniBatchKMeans(n_clusters=k, random_state=0, batch_size=1000, n_init=3)
     labels = kmeans.fit_predict(pixels)
     centers = kmeans.cluster_centers_.astype(np.uint8)
-
-    quantized = centers[labels].reshape(np_img.shape)
-    return quantized, centers, labels.reshape(img.size[1], img.size[0])
+    return centers, labels.reshape(img.size[1], img.size[0])
 
 @app.route('/')
 def home():
@@ -123,31 +147,28 @@ def home():
 def process():
     try:
         f = request.files['image']
-        n = int(request.form.get('layers', 5))
+        n = int(request.form.get('layers', 4))
+        remove_bg = request.form.get('removebg', 'true') == 'true'
+        keep_bg = request.form.get('keepbg', 'false') == 'true'
 
         img = Image.open(f.stream).convert('RGB')
 
-        # 1. Preprocess
-        img, (w, h) = preprocess_image(img, 1200)
+        # Preprocess
+        img, (w, h) = preprocess_image(img, 1200, remove_bg)
 
-        # 2. Quantize colors FIRST - this is the main fix
-        quantized_img, centers, lbl_img = color_quantize(img, n)
+        # Color quantization
+        centers, lbl_img = color_quantize(img, n)
 
         layers = []
         layer_data = []
 
         for i in range(n):
             mask = (lbl_img == i).astype(np.uint8) * 255
-
-            # Clean mask
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
 
-            # Find external contours only - no holes in holes
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            # Filter tiny noise
-            contours = [c for c in contours if cv2.contourArea(c) > 100]
+            contours = [c for c in contours if cv2.contourArea(c) > 150]
 
             if not contours:
                 continue
@@ -181,11 +202,33 @@ def process():
                 'data': base64.b64encode(svg.encode()).decode()
             })
 
-        # 3. Sort by brightness for correct 3D stack
-        # Dark = bottom, Light = top
+        # Sort by brightness: dark = bottom, light = top
         layer_data.sort(key=lambda x: x['brightness'])
 
-        # 4. Build instruction SVG
+        # If keep background is checked, add it as layer 0
+        if keep_bg and remove_bg:
+            # Create background layer from original image
+            bg_mask = np.ones((h, w), dtype=np.uint8) * 255
+            bg_path = f"M 0 0 L {w} 0 L {w} {h} L 0 {h} Z"
+
+            # Insert at beginning as bottom layer
+            layer_data.insert(0, {
+                'color': '#FFFFFF',
+                'path': bg_path,
+                'brightness': 255,
+                'idx': -1
+            })
+
+            bg_svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
+            bg_svg += f'<rect width="100%" height="100%" fill="white"/>'
+            bg_svg += '</svg>'
+
+            layers.insert(0, {
+                'name': 'layer_0_background.svg',
+                'data': base64.b64encode(bg_svg.encode()).decode()
+            })
+
+        # Build instruction SVG
         ox, oy = 15, -15
         iw = w + abs(ox)*(len(layer_data)-1) + 40
         ih = h + abs(oy)*(len(layer_data)-1) + 40
@@ -211,8 +254,7 @@ def process():
             zf.writestr('instructions.svg', inst)
         zip_b64 = base64.b64encode(zb.getvalue()).decode()
 
-        # Sort download layers to match instruction order
-        layers_sorted = [layers[d['idx']] for d in layer_data]
+        layers_sorted = [layers[d['idx']] if d['idx'] >= 0 else layers[0] for d in layer_data]
 
         return jsonify({
             'layers': layers_sorted,
