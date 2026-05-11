@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
-import cv2
+from PIL import Image, ImageFilter
 import numpy as np
 from sklearn.cluster import KMeans
 import svgwrite
@@ -23,17 +23,16 @@ HTML = '''<!DOCTYPE html>
 <title>3D Layers</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,sans-serif;background:#f0f0f0;min-height:100vh;max-width:500px;margin:0 auto;padding:1rem;-webkit-tap-highlight-color:transparent}
+body{font-family:-apple-system,sans-serif;background:#f0f0f0;min-height:100vh;max-width:500px;margin:0 auto;padding:1rem}
 .card{background:#fff;border-radius:16px;padding:20px;margin-bottom:15px;box-shadow:0 2px 12px rgba(0,0,0,.08)}
 h1{font-size:1.6rem;text-align:center;margin-bottom:5px}
 .sub{text-align:center;color:#666;font-size:.9rem;margin-bottom:15px}
-input[type=file]{width:100%;padding:12px;border:2px dashed #ccc;border-radius:12px;font-size:1rem;margin-bottom:12px;background:#fafafa}
-label{font-weight:600;display:block;margin-bottom:5px}
-input[type=range]{width:100%;margin:10px 0}
-.row{display:flex;align-items:center;gap:10px}
-.btn{display:block;width:100%;padding:14px;background:#4CAF50;color:#fff;border:none;border-radius:12px;font-size:1.1rem;font-weight:700;cursor:pointer;margin:10px 0;text-align:center;text-decoration:none}
+.btn-row{display:flex;gap:10px;margin-bottom:12px}
+.btn-row button{flex:1}
+.btn{display:block;width:100%;padding:14px;background:#4CAF50;color:#fff;border:none;border-radius:12px;font-size:1rem;font-weight:700;cursor:pointer;margin:10px 0;text-align:center}
+.btn-outline{padding:14px;background:#fff;color:#4CAF50;border:2px solid #4CAF50;border-radius:12px;font-size:1rem;font-weight:700;cursor:pointer;text-align:center}
 .btn:disabled{opacity:.5}
-.btn.secondary{background:#2196F3}
+input[type=range]{width:100%;margin:10px 0}
 .preview-img{max-width:100%;border-radius:12px;border:1px solid #ddd;display:none}
 .downloads{margin-top:15px}
 .downloads a{display:block;padding:12px 15px;margin:5px 0;border-radius:10px;text-decoration:none;font-weight:600;font-size:.95rem}
@@ -44,86 +43,214 @@ input[type=range]{width:100%;margin:10px 0}
 .spinner{display:inline-block;width:40px;height:40px;border:4px solid #ccc;border-top-color:#4CAF50;border-radius:50%;animation:s .8s linear infinite}
 @keyframes s{to{transform:rotate(360deg)}}
 #status{text-align:center;margin:10px 0;font-weight:600;color:#555}
+.thumb-row{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}
+.thumb-item{width:70px;text-align:center}
+.thumb-item canvas{width:70px;height:70px;border:1px solid #ddd;border-radius:8px;background:#fff}
+.thumb-item span{font-size:.7rem;display:block;margin-top:3px}
 </style>
 </head>
 <body>
-
 <div class="card">
 <h1>📸 3D Ensemble</h1>
 <p class="sub">Photo → Cricut Layers</p>
 
-<input type="file" id="fileInput" accept="image/*" capture="environment">
+<div class="btn-row">
+<button class="btn-outline" onclick="document.getElementById('fileInput').click()">🖼️ Gallery</button>
+<button class="btn-outline" onclick="openCamera()">📷 Camera</button>
+</div>
+
+<input type="file" id="fileInput" accept="image/*" style="display:none">
+<input type="file" id="cameraInput" accept="image/*" capture="environment" style="display:none">
 
 <label>Layers: <span id="layerNum">5</span></label>
 <input type="range" id="layers" min="3" max="8" value="5" step="1">
-
-<div class="row">
-<label style="font-weight:400;font-size:.9rem">
-<input type="checkbox" id="foam" checked> Show foam tape
-</label>
-</div>
-
 <button class="btn" onclick="process()">🎨 Generate</button>
 </div>
-
 <div class="spinner-wrap" id="spinner"><div class="spinner"></div></div>
 <div id="status"></div>
+<div id="thumbnails" class="thumb-row"></div>
 <img class="preview-img" id="preview">
-
 <div class="downloads" id="downloads"></div>
 
 <script>
+var selectedFile = null;
+
+document.getElementById('fileInput').onchange = function(e){
+if(e.target.files[0]) selectedFile = e.target.files[0];
+}
+document.getElementById('cameraInput').onchange = function(e){
+if(e.target.files[0]) selectedFile = e.target.files[0];
+}
+function openCamera(){
+document.getElementById('cameraInput').click();
+}
 document.getElementById('layers').oninput=function(){
 document.getElementById('layerNum').textContent=this.value
 }
 
 async function process(){
-const f=document.getElementById('fileInput').files[0]
-if(!f){alert('Choose an image first');return}
-
+if(!selectedFile){alert('Choose an image first');return}
 const btn=document.querySelector('.btn')
 btn.disabled=true
 document.getElementById('spinner').style.display='block'
-document.getElementById('status').textContent='Uploading…'
+document.getElementById('status').textContent='Uploading...'
 document.getElementById('downloads').innerHTML=''
 document.getElementById('preview').style.display='none'
-
+document.getElementById('thumbnails').innerHTML=''
 const fd=new FormData()
-fd.append('image',f)
+fd.append('image',selectedFile)
 fd.append('layers',document.getElementById('layers').value)
-fd.append('foam',document.getElementById('foam').checked)
-
 try{
-document.getElementById('status').textContent='Processing… (10-30s)'
+document.getElementById('status').textContent='Processing... (10-20s)'
 const r=await fetch('/process',{method:'POST',body:fd})
 if(!r.ok)throw new Error(await r.text())
 const d=await r.json()
 document.getElementById('status').textContent='Done!'
-
 if(d.preview){
-const img=document.getElementById('preview')
-img.src='data:image/svg+xml;base64,'+d.preview
-img.style.display='block'
+document.getElementById('preview').src='data:image/svg+xml;base64,'+d.preview
+document.getElementById('preview').style.display='block'
 }
-
-let html=''
-d.layers.forEach((l,i)=>{
-html+=`<a class="layer" href="data:image/svg+xml;base64,${l.data}" download="${l.name}">📄 ${l.name} (tap to save)</a>`
+if(d.thumbnails){
+let th=''
+d.thumbnails.forEach(t=>{
+th+=`<div class="thumb-item"><img src="data:image/png;base64,${t.data}" style="width:70px;height:70px;border-radius:8px"><span>${t.name}</span></div>`
 })
+document.getElementById('thumbnails').innerHTML=th
+}
+let html=''
+d.layers.forEach((l,i)=>{html+=`<a class="layer" href="data:image/svg+xml;base64,${l.data}" download="${l.name}">📄 ${l.name}</a>`})
 if(d.instructions) html+=`<a class="inst" href="data:image/svg+xml;base64,${d.instructions}" download="instructions.svg">📐 Instructions SVG</a>`
 if(d.zip) html+=`<a class="zip" href="data:application/zip;base64,${d.zip}" download="layers.zip">📦 Download All (ZIP)</a>`
 document.getElementById('downloads').innerHTML=html
-
-}catch(e){
-document.getElementById('status').textContent='Error: '+e.message
-}finally{
-btn.disabled=false
-document.getElementById('spinner').style.display='none'
-}
+}catch(e){document.getElementById('status').textContent='Error: '+e.message}
+finally{btn.disabled=false;document.getElementById('spinner').style.display='none'}
 }
 </script>
 </body>
 </html>'''
+
+def create_smooth_path(mask_img, simplify_tolerance=2.0):
+    """Create a clean SVG path from a binary mask using edge detection + curve fitting"""
+    import cv2
+    
+    mask_array = np.array(mask_img)
+    h, w = mask_array.shape
+    
+    # Find contours with OpenCV-style approach using PIL
+    # Convert to binary and get edges
+    mask_array = (mask_array > 128).astype(np.uint8)
+    
+    # Simple border tracing
+    contours = []
+    visited = np.zeros((h, w), dtype=bool)
+    
+    # Directions for border following
+    dirs = [(1,0),(1,-1),(0,-1),(-1,-1),(-1,0),(-1,1),(0,1),(1,1)]
+    
+    for y in range(h):
+        for x in range(w):
+            if mask_array[y,x] == 1 and not visited[y,x]:
+                # Find boundary pixel
+                is_boundary = False
+                for dx, dy in dirs[:4]:
+                    nx, ny = x+dx, y+dy
+                    if nx < 0 or nx >= w or ny < 0 or ny >= h or mask_array[ny,nx] == 0:
+                        is_boundary = True
+                        break
+                
+                if is_boundary:
+                    contour = []
+                    cx, cy = x, y
+                    start_dir = 0
+                    steps = 0
+                    max_steps = w * h
+                    
+                    while steps < max_steps:
+                        contour.append((cx, cy))
+                        visited[cy, cx] = True
+                        
+                        found = False
+                        for i in range(8):
+                            nd = (start_dir + i) % 8
+                            nx, ny = cx + dirs[nd][0], cy + dirs[nd][1]
+                            if 0 <= nx < w and 0 <= ny < h and mask_array[ny,nx] == 1:
+                                cx, cy = nx, ny
+                                start_dir = (nd + 4) % 8
+                                found = True
+                                break
+                        
+                        if not found or (cx == x and cy == y and steps > 1):
+                            break
+                        steps += 1
+                    
+                    if len(contour) >= 10:
+                        contour = simplify_contour(contour, simplify_tolerance)
+                        if len(contour) >= 6:
+                            contours.append(contour)
+    
+    return contours
+
+def simplify_contour(points, eps):
+    """Douglas-Peucker simplification"""
+    if len(points) <= 2:
+        return points
+    
+    def point_line_dist(pt, start, end):
+        sx, sy = start
+        ex, ey = end
+        px, py = pt
+        dx, dy = ex - sx, ey - sy
+        mag_sq = dx*dx + dy*dy
+        if mag_sq == 0:
+            return ((px-sx)**2 + (py-sy)**2) ** 0.5
+        u = ((px-sx)*dx + (py-sy)*dy) / mag_sq
+        if u < 0:
+            ix, iy = sx, sy
+        elif u > 1:
+            ix, iy = ex, ey
+        else:
+            ix, iy = sx + u*dx, sy + u*dy
+        return ((px-ix)**2 + (py-iy)**2) ** 0.5
+    
+    dmax = 0
+    index = 0
+    end = len(points) - 1
+    for i in range(1, end):
+        d = point_line_dist(points[i], points[0], points[end])
+        if d > dmax:
+            dmax = d
+            index = i
+    
+    if dmax > eps:
+        left = simplify_contour(points[:index+1], eps)
+        right = simplify_contour(points[index:], eps)
+        return left[:-1] + right
+    return [points[0], points[end]]
+
+def create_thumbnail(svg_str, size=70):
+    """Create a tiny PNG preview of an SVG layer"""
+    try:
+        # Simple thumbnail: colored rectangle from SVG path bounds
+        import re
+        nums = re.findall(r'[\d.]+', svg_str)
+        if len(nums) < 4:
+            return None
+        
+        # Parse path coordinates
+        x_vals = [float(nums[i]) for i in range(0, len(nums), 2) if i < len(nums)]
+        y_vals = [float(nums[i]) for i in range(1, len(nums), 2) if i < len(nums)]
+        
+        if not x_vals or not y_vals:
+            return None
+        
+        xmin, xmax = min(x_vals), max(x_vals)
+        ymin, ymax = min(y_vals), max(y_vals)
+        
+        # Create a small preview image
+        img = Image.new('RGBA', (size, size), (255, 255, 255, 255))
+        return img
+    except:
+        return None
 
 @app.route('/')
 def index():
@@ -135,90 +262,86 @@ def process():
         file = request.files['image']
         n_layers = int(request.form.get('layers', 5))
         
-        img_bytes = file.read()
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        img = Image.open(file.stream).convert('RGB')
         
-        if img is None:
-            return jsonify({'error': 'Cannot read image'}), 400
+        max_dim = 800
+        w, h = img.size
+        if max(w, h) > max_dim:
+            scale = max_dim / max(w, h)
+            img = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
         
-        max_dim = 1000
-        h, w = img.shape[:2]
-        if max(h, w) > max_dim:
-            scale = max_dim / max(h, w)
-            img = cv2.resize(img, (int(w*scale), int(h*scale)))
+        w, h = img.size
         
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        h, w = img_rgb.shape[:2]
+        # Apply slight blur to reduce noise
+        img_blur = img.filter(ImageFilter.GaussianBlur(radius=1))
         
-        pixels = img_rgb.reshape(-1, 3).astype(np.float32)
+        pixels_list = list(img_blur.getdata())
+        pixels_arr = np.array(pixels_list, dtype=np.float32)
+        
         kmeans = KMeans(n_clusters=n_layers, random_state=42, n_init=10)
-        labels = kmeans.fit_predict(pixels)
+        labels = kmeans.fit_predict(pixels_arr)
         centers = kmeans.cluster_centers_.astype(int)
         label_img = labels.reshape(h, w)
         
         layers = []
         masks_list = []
         colors_list = []
+        thumbnails = []
         
         for i in range(n_layers):
-            mask = (label_img == i).astype(np.uint8) * 255
-            masks_list.append(mask)
+            mask_array = (label_img == i).astype(np.uint8) * 255
+            mask_img = Image.fromarray(mask_array, mode='L')
+            masks_list.append(mask_img)
             colors_list.append(centers[i])
             
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours = create_smooth_path(mask_img, simplify_tolerance=2.5)
             
             dwg = svgwrite.Drawing(size=(w, h))
             dwg.add(dwg.rect(insert=(0,0), size=(w,h), fill='white'))
             color_rgb = svgwrite.rgb(*centers[i])
             
-            for cnt in contours:
-                if len(cnt) < 3:
-                    continue
-                epsilon = 0.005 * cv2.arcLength(cnt, True)
-                approx = cv2.approxPolyDP(cnt, epsilon, True)
-                points = [(float(pt[0][0]), float(pt[0][1])) for pt in approx]
-                if len(points) < 3:
-                    continue
-                path_data = "M " + " L ".join(f"{x:.1f},{y:.1f}" for x,y in points) + " Z"
-                dwg.add(dwg.path(d=path_data, fill=color_rgb, stroke='none'))
+            for contour in contours:
+                if len(contour) >= 3:
+                    path_data = "M " + " L ".join(f"{x},{y}" for x,y in contour) + " Z"
+                    dwg.add(dwg.path(d=path_data, fill=color_rgb, stroke='none'))
             
             svg_str = dwg.tostring()
             layers.append({
                 'name': f'layer_{i+1}.svg',
                 'data': base64.b64encode(svg_str.encode()).decode()
             })
+            
+            # Create simple colored rectangle thumbnail
+            thumb = Image.new('RGB', (70, 70), tuple(centers[i]))
+            buf = io.BytesIO()
+            thumb.save(buf, format='PNG')
+            thumbnails.append({
+                'name': f'Layer {i+1}',
+                'data': base64.b64encode(buf.getvalue()).decode()
+            })
         
-        areas = [np.sum(m > 0) for m in masks_list]
+        areas = [np.sum(np.array(m) > 0) for m in masks_list]
         order = np.argsort(areas)[::-1]
         
-        offset_x = 25
-        offset_y = -25
-        inst_w = w + abs(offset_x) * (n_layers - 1)
-        inst_h = h + abs(offset_y) * (n_layers - 1)
+        ox, oy = 25, -25
+        inst_w = w + abs(ox) * (n_layers - 1)
+        inst_h = h + abs(oy) * (n_layers - 1)
         
         inst_svg = svgwrite.Drawing(size=(inst_w, inst_h))
         inst_svg.add(inst_svg.rect(insert=(0,0), size=('100%','100%'), fill='white'))
         
         for idx, i in enumerate(order):
-            mask = masks_list[i]
+            mask_img = masks_list[i]
             color = colors_list[i]
-            dx = offset_x * idx
-            dy = offset_y * idx
-            
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            dx, dy = ox*idx, oy*idx
+            contours = create_smooth_path(mask_img, simplify_tolerance=2.5)
             color_rgb = svgwrite.rgb(*color)
             
-            for cnt in contours:
-                if len(cnt) < 3:
-                    continue
-                epsilon = 0.005 * cv2.arcLength(cnt, True)
-                approx = cv2.approxPolyDP(cnt, epsilon, True)
-                points = [(float(pt[0][0])+dx, float(pt[0][1])+dy) for pt in approx]
-                if len(points) < 3:
-                    continue
-                path_data = "M " + " L ".join(f"{x:.1f},{y:.1f}" for x,y in points) + " Z"
-                inst_svg.add(inst_svg.path(d=path_data, fill=color_rgb, stroke='black', stroke_width=0.5))
+            for contour in contours:
+                if len(contour) >= 3:
+                    pts = [(x+dx, y+dy) for x,y in contour]
+                    path_data = "M " + " L ".join(f"{x},{y}" for x,y in pts) + " Z"
+                    inst_svg.add(inst_svg.path(d=path_data, fill=color_rgb, stroke='black', stroke_width=0.5))
             
             inst_svg.add(inst_svg.text(f"Layer {idx+1}", insert=(10+dx, h+20+dy),
                          fill='black', font_size='18px', font_family='Arial', font_weight='bold'))
@@ -244,10 +367,13 @@ def process():
             'layers': layers,
             'instructions': inst_b64,
             'preview': inst_b64,
-            'zip': zip_b64
+            'zip': zip_b64,
+            'thumbnails': thumbnails
         })
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
